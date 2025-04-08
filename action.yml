@@ -1,0 +1,211 @@
+# .github/changelog-releaser-action/action.yml
+name: 'Changelog Releaser Action'
+description: 'Calculates version, generates changelog notes using conventional-commits, tags, and creates a release.'
+
+inputs:
+  github-token:
+    description: 'GitHub token for API calls (tagging, releasing, pushing changelog).'
+    required: true
+    default: ${{ github.token }} # Use the workflow's token by default
+  triggering-pr-title:
+    description: 'Title of the PR that triggered the workflow (for bump keywords).'
+    required: true
+  triggering-pr-body:
+    description: 'Body of the PR that triggered the workflow (for bump keywords).'
+    required: false # Allow empty body
+  update-changelog-file:
+    description: 'Whether to update and commit the CHANGELOG.md file.'
+    required: false
+    default: 'false'
+  changelog-file-path:
+    description: 'Path to the changelog file if updating.'
+    required: false
+    default: 'CHANGELOG.md'
+  conventional-changelog-preset:
+    description: 'Preset for conventional-changelog-cli (e.g., angular, atom, eslint).'
+    required: false
+    default: 'angular'
+  git-user-name:
+    description: 'Git user name for commits (e.g., CHANGELOG.md).'
+    required: false
+    default: 'github-actions[bot]'
+  git-user-email:
+    description: 'Git user email for commits.'
+    required: false
+    default: 'github-actions[bot]@users.noreply.github.com'
+  default-branch:
+    description: 'The default branch of the repository (used for pushing CHANGELOG.md).'
+    required: false
+    default: ${{ github.event.repository.default_branch }} # Get from event context if possible
+
+outputs:
+  new-version:
+    description: 'The calculated full version tag (e.g., v1.2.3).'
+  version-number:
+    description: 'The calculated version number without the "v" prefix (e.g., 1.2.3).'
+  release-url:
+    description: 'The URL of the created GitHub release.'
+  release-notes:
+    description: 'The generated release notes content.'
+
+runs:
+  using: "composite"
+  steps:
+    # Step 1: Determine Version Bump (Using PR Keywords)
+    - name: Determine bump type
+      id: determine_bump
+      shell: bash
+      run: |
+        title=$(echo "${{ inputs.triggering-pr-title }}" | tr '[:upper:]' '[:lower:]')
+        body=$(echo "${{ inputs.triggering-pr-body }}" | tr '[:upper:]' '[:lower:]')
+        content="$title $body"
+        bump_type="patch" # Default
+        echo "Checking PR content for bump keywords..."
+        if [[ "$content" == *bump_major* ]]; then bump_type="major"; echo "Found 'bump_major'.";
+        elif [[ "$content" == *bump_minor* ]]; then bump_type="minor"; echo "Found 'bump_minor'.";
+        elif [[ "$content" == *bump_patch* ]]; then bump_type="patch"; echo "Found 'bump_patch'.";
+        else echo "No specific bump keyword found. Defaulting to 'patch'."; fi
+        echo "Determined bump type: $bump_type"
+        echo "bump_type=$bump_type" >> $GITHUB_OUTPUT
+
+    # Step 2: Calculate Next Version Tag
+    - name: Get latest tag
+      id: get_tag
+      shell: bash
+      run: |
+        latest_tag=$(git describe --tags --abbrev=0 --match="v[0-9]*.[0-9]*.[0-9]*" 2>/dev/null || echo "v0.0.0")
+        echo "Latest tag found: $latest_tag"
+        echo "latest_tag=$latest_tag" >> $GITHUB_OUTPUT
+
+    - name: Calculate next version
+      id: calculate_version
+      shell: bash
+      run: |
+        latest_tag="${{ steps.get_tag.outputs.latest_tag }}"
+        bump_type="${{ steps.determine_bump.outputs.bump_type }}"
+        new_version=""
+        if [[ "$latest_tag" == "v0.0.0" ]]; then
+          echo "No previous SemVer tag found. Creating initial release v1.0.0."
+          new_version="v1.0.0"
+        else
+          echo "Previous version $latest_tag found. Bumping based on '$bump_type'."
+          version=${latest_tag#v}; IFS='.' read -r -a parts <<< "$version"
+          major=${parts[0]:-0}; minor=${parts[1]:-0}; patch=${parts[2]:-0}
+          case "$bump_type" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          new_version="v$major.$minor.$patch"
+        fi
+        version_number=${new_version#v}
+        echo "Calculated next version: $new_version"
+        echo "new_version=$new_version" >> $GITHUB_OUTPUT
+        echo "version_number=$version_number" >> $GITHUB_OUTPUT
+
+    # Step 3: Setup Node.js environment
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 'lts/*'
+
+    # Step 4: Install Changelog Generator
+    - name: Install conventional-changelog-cli
+      shell: bash
+      run: npm install -g conventional-changelog-cli
+
+    # Step 5: Optional - Update CHANGELOG.md
+    - name: Update CHANGELOG.md file
+      if: inputs.update-changelog-file == 'true'
+      shell: bash
+      run: |
+        echo "Attempting to update ${{ inputs.changelog-file-path }}"
+        # Ensure package.json exists or provide necessary info via args if possible
+        if [ ! -f package.json ]; then
+          echo '{"version": "${{ steps.calculate_version.outputs.version-number }}"}' > package.json
+          echo "Created temporary package.json"
+        fi
+        conventional-changelog -p ${{ inputs.conventional-changelog-preset }} -i ${{ inputs.changelog-file-path }} -s --commit-path . --pkg package.json
+        echo "${{ inputs.changelog-file-path }} update attempted."
+
+    - name: Commit and Push CHANGELOG.md
+      if: inputs.update-changelog-file == 'true'
+      shell: bash
+      run: |
+        if [[ `git status --porcelain ${{ inputs.changelog-file-path }}` ]]; then
+          echo "Committing updated ${{ inputs.changelog-file-path }}"
+          git config user.name "${{ inputs.git-user-name }}"
+          git config user.email "${{ inputs.git-user-email }}"
+          git add ${{ inputs.changelog-file-path }}
+          # Also add temp package.json if it was created by this action
+          if [ -f package.json ] && [[ "$(cat package.json)" == '{"version": "'*'"}' ]]; then
+             git add package.json
+          fi
+          git commit -m "docs(changelog): update ${{ inputs.changelog-file-path }} for ${{ steps.calculate_version.outputs.new_version }}" -m "[skip ci]" # Add skip ci if needed
+          git push origin ${{ inputs.default-branch }}
+        else
+          echo "${{ inputs.changelog-file-path }} was not modified."
+        fi
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }} # Use token for push
+
+    # Step 6: Generate Release Notes Content
+    - name: Generate Release Notes Content
+      id: generate_content
+      shell: bash
+      run: |
+        echo "Generating release notes content for ${{ steps.calculate_version.outputs.version_number }}"
+        # Ensure package.json exists or provide necessary info via args if possible
+        if [ ! -f package.json ]; then
+          echo '{"version": "${{ steps.calculate_version.outputs.version-number }}"}' > package.json
+           echo "Created temporary package.json for release note generation"
+        fi
+        # Generate notes only for the NEW release, output to stdout
+        release_notes=$(conventional-changelog -p ${{ inputs.conventional-changelog-preset }} -r 1 --commit-path . --pkg package.json --release-as ${{ steps.calculate_version.outputs.version_number }} --outfile /dev/stdout)
+
+        # Prepare notes for multiline output (using environment file is robust)
+        echo "Generated notes:"
+        echo "$release_notes" # Log the notes
+        echo "release_notes<<EOF" >> $GITHUB_OUTPUT
+        echo "$release_notes" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    # Step 7: Create Git Tag
+    - name: Create Git Tag
+      shell: bash
+      run: |
+        new_version="${{ steps.calculate_version.outputs.new_version }}"
+        echo "Creating tag $new_version"
+        git config user.name "${{ inputs.git-user-name }}"
+        git config user.email "${{ inputs.git-user-email }}"
+        git tag -a "$new_version" -m "Release $new_version"
+        git push origin "$new_version"
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }} # Use token for push
+
+    # Step 8: Create GitHub Release
+    - name: Create GitHub Release
+      id: create_release # Give this step an ID to access its outputs
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      with:
+        tag_name: ${{ steps.calculate_version.outputs.new_version }}
+        release_name: ${{ steps.calculate_version.outputs.new_version }}
+        body: ${{ steps.generate_content.outputs.release_notes }}
+        draft: false
+        prerelease: false
+
+    # Step 9: Set Action Outputs
+    - name: Set Action Outputs
+      id: set_outputs
+      shell: bash
+      run: |
+        echo "new-version=${{ steps.calculate_version.outputs.new_version }}" >> $GITHUB_OUTPUT
+        echo "version-number=${{ steps.calculate_version.outputs.version_number }}" >> $GITHUB_OUTPUT
+        echo "release-url=${{ steps.create_release.outputs.html_url }}" >> $GITHUB_OUTPUT
+        # Pass through the potentially long release notes
+        notes_output="${{ steps.generate_content.outputs.release_notes }}"
+        echo "release-notes<<EOF" >> $GITHUB_OUTPUT
+        echo "$notes_output" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
